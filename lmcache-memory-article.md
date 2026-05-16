@@ -267,3 +267,16 @@ class MemoryAgent:
 - **预测性预取池化**：Agent 根据历史对话模式预判下一轮可能出现的 chunk，在用户打字间隙批量预取到 DDR
 - **语义权重驱逐**：为 DDR 中的 chunk 附加语义权重（高频/低频），实现比纯 LRU 更智能的空间管理
 - **分布式记忆共享**：将语义→hash 映射表扩展到多节点，实现跨实例的 KV Cache 协同
+
+
+LLM推理已经在千行百业落地，但在多轮对话、Agent、RAG等场景中，推理引擎本身并不理解"用户到底在聊什么"。每一次请求，vLLM只是机械地计算KV Cache，LMCache只是被动地存取。AgentOS智能记忆相当于一个能够感知语义、预判复用、主动调度缓存的上层大脑，在用户prompt到达推理引擎之前，根据语义预判哪些KV Cache会被复用、哪些已经过时，并主动指挥LMCache完成驱逐和预取，从而将TTFT从秒级压缩到毫秒级。
+
+LMCache 已经构建了 GPU HBM → CPU DDR → Local SSD 的多级KVCache存储体系，上层记忆系统掌握语义，直接指挥 LMCache 的存储操作；vLLM 作为推理引擎居中调度，并在请求结束时将新产生的 chunk_hash 回传给记忆系统。
+chunk_hash：KV Cache 的全局身份证
+chunk_hash 是整个协同框架的通信基石。LMCache 通过 ChunkedTokenDatabase 将 token 序列按 chunksize（默认 256 tokens）切块，对每个 chunk 执行滚动前缀哈希，相同 token 序列、相同 PYTHONHASHSEED → 永远产出相同 hash，天然支持跨请求复用。hash[i] 依赖 hash[i-1]，形成不可篡改的链式结构，保证 chunk 顺序。vllm的响应中预留了kv_transfer_params字段，可在请求完成返回时将chunk_hash添加进去，通过请求响应返回给上层应用，记忆系统再根据请求和chunk_hash建立映射表。
+
+/memory/evict：语义驱动的精细化驱逐
+当 Agent 判定某个话题的 KV Cache 不再需要时，直接调用 LMCache 的驱逐接口，释放 DDR 或 SSD 空间。在 vLLM 多进程模式（TP 多卡）下，Scheduler 进程收到请求后会自动通过 forwardtoallworkers() 广播到所有 Worker 进程，确保每个 TP Rank 的 KV 分片都被清理。
+
+/memory/prefetch：预测性预取
+当 Agent 预判某个历史会话即将被复用时，在推理发起前调用预取接口，将 KV Cache 从 SSD 异步加载到 DDR。数据在后台从 SSD 传输到 DDR，不阻塞主流程
